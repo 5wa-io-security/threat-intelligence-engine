@@ -1,0 +1,57 @@
+name: Collect Threat Intelligence
+
+on:
+  # Run daily at midnight UTC
+  schedule:
+    - cron: '0 0 * * *'
+
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      log_level:
+        description: 'Log level (debug, info, warn, error)'
+        required: false
+        default: 'info'
+        type: choice
+        options:
+          - debug
+          - info
+          - warn
+          - error
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  collect:
+    name: Run Threat Intelligence Collection
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run collector pipeline
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LOG_LEVEL: ${{ inputs.log_level || 'info' }}
+        run: npm run collect
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collection-logs-${{ github.run_id }}
+          path: |
+            *.log
+          retention-days: 7

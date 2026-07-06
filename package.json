@@ -1,0 +1,39 @@
+{
+  "name": "@5wa-io/threat-intelligence-engine",
+  "version": "1.0.0",
+  "description": "Threat Intelligence Engine - Collects and structures crypto physical attack/crime data from public sources",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "collect": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "lint": "eslint src/**/*.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "threat-intelligence",
+    "crypto",
+    "security",
+    "physical-attacks",
+    "5wa"
+  ],
+  "author": "5WA Security Team <team@5wa.io>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/5wa-io-security/threat-intelligence-engine.git"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5",
+    "rss-parser": "^3.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
