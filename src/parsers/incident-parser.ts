@@ -227,6 +227,8 @@ export function parseIncident(raw: RawInput): ThreatIncident {
     published_at: raw.publishedAt,
     country: geo.country,
     city: geo.city,
+    latitude: geo.latitude,
+    longitude: geo.longitude,
     amount_usd: amountUsd,
     attack_type: attackType,
     victim_type: victimType,

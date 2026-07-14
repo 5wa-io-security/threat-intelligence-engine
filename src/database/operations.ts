@@ -31,6 +31,8 @@ export interface ThreatIncident {
   published_at: string;
   country: string;
   city: string | null;
+  latitude: number | null;
+  longitude: number | null;
   amount_usd: number | null;
   attack_type: AttackType;
   victim_type: VictimType;
