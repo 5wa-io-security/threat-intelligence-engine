@@ -1,15 +1,18 @@
 /**
- * RSS Feed Collector for CryptoSlate and CoinTelegraph.
- * Fetches articles from RSS feeds and filters for physical attack-related content.
+ * RSS Feed Collector — CryptoSlate, CoinTelegraph, CoinDesk, The Block,
+ * Decrypt, BleepingComputer, Bitcoin Magazine, CryptoNews.
+ *
+ * Uses dual-group keyword matching: an article must contain at least one
+ * physical-threat keyword AND at least one crypto-context keyword.
  */
 
 import Parser from 'rss-parser';
 import { createLogger } from '../utils/logger.js';
 import {
   RSS_FEEDS,
-  PHYSICAL_ATTACK_KEYWORDS,
   SOURCE_NAMES,
   RATE_LIMITS,
+  matchesDualGroupKeywords,
 } from '../utils/constants.js';
 
 const logger = createLogger('rss-collector');
@@ -28,15 +31,7 @@ export interface RawArticle {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /**
- * Check if text contains any physical attack keywords.
- */
-function matchesPhysicalAttackKeywords(text: string): boolean {
-  const lowerText = text.toLowerCase();
-  return PHYSICAL_ATTACK_KEYWORDS.some((keyword) => lowerText.includes(keyword.toLowerCase()));
-}
-
-/**
- * Strip HTML tags from text content.
+ * Strip HTML tags and decode common HTML entities.
  */
 function stripHtml(html: string): string {
   return html
@@ -51,61 +46,60 @@ function stripHtml(html: string): string {
     .trim();
 }
 
-/**
- * Sleep for a specified number of milliseconds.
- */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ─── Main Collector ──────────────────────────────────────────────────────────
+// ─── Feed Fetcher ─────────────────────────────────────────────────────────────
+
+const rssParser = new Parser({
+  timeout: 30000,
+  headers: {
+    'User-Agent': '5WA-ThreatIntelligenceEngine/1.0 (+https://5wa.io)',
+    Accept: 'application/rss+xml, application/xml, text/xml, */*',
+  },
+  customFields: {
+    item: [['media:content', 'mediaContent'], ['content:encoded', 'contentEncoded']],
+  },
+});
 
 /**
- * Fetch and filter articles from a single RSS feed.
+ * Fetch and filter articles from a single RSS feed URL.
  */
-async function fetchFeed(
-  feedUrl: string,
-  sourceName: string
-): Promise<RawArticle[]> {
-  const parser = new Parser({
-    timeout: 30000,
-    headers: {
-      'User-Agent': '5WA-ThreatIntelligenceEngine/1.0 (+https://5wa.io)',
-      Accept: 'application/rss+xml, application/xml, text/xml',
-    },
-  });
-
-  logger.info(`Fetching RSS feed`, { source: sourceName, url: feedUrl });
+async function fetchFeed(feedUrl: string, sourceName: string): Promise<RawArticle[]> {
+  logger.info('Fetching RSS feed', { source: sourceName, url: feedUrl });
 
   try {
-    const feed = await parser.parseURL(feedUrl);
+    const feed = await rssParser.parseURL(feedUrl);
     const articles: RawArticle[] = [];
 
-    logger.info(`Feed fetched successfully`, {
-      source: sourceName,
-      totalItems: feed.items?.length ?? 0,
-    });
+    logger.debug('Feed fetched', { source: sourceName, items: feed.items?.length ?? 0 });
 
     for (const item of feed.items ?? []) {
       const title = item.title ?? '';
-      const content = stripHtml(item['content:encoded'] ?? item.content ?? item.contentSnippet ?? '');
-      const snippet = item.contentSnippet ?? stripHtml(item.content ?? '').slice(0, 500);
+      const itemAny = item as unknown as Record<string, unknown>;
+      const rawContent =
+        itemAny['contentEncoded'] as string ??
+        itemAny['content:encoded'] as string ??
+        item.content ??
+        '';
+      const content = stripHtml(rawContent);
+      const snippet = item.contentSnippet ?? content.slice(0, 500);
       const combinedText = `${title} ${content} ${snippet}`;
 
-      // Filter: only include articles about physical attacks
-      if (matchesPhysicalAttackKeywords(combinedText)) {
+      if (matchesDualGroupKeywords(combinedText)) {
         articles.push({
           title: title.trim(),
           link: item.link ?? '',
           sourceName,
           publishedAt: item.isoDate ?? item.pubDate ?? new Date().toISOString(),
-          content: content.slice(0, 10000), // Cap raw content at 10k chars
+          content: content.slice(0, 10000),
           snippet: snippet.slice(0, 500),
         });
       }
     }
 
-    logger.info(`Filtered articles from feed`, {
+    logger.info('Feed filtered', {
       source: sourceName,
       matched: articles.length,
       total: feed.items?.length ?? 0,
@@ -113,7 +107,7 @@ async function fetchFeed(
 
     return articles;
   } catch (error) {
-    logger.error(`Failed to fetch RSS feed`, {
+    logger.error('Failed to fetch RSS feed', {
       source: sourceName,
       url: feedUrl,
       error: error instanceof Error ? error.message : String(error),
@@ -122,38 +116,42 @@ async function fetchFeed(
   }
 }
 
+// ─── Main Collector ──────────────────────────────────────────────────────────
+
+// Map source key → source name for all configured feeds
+const FEED_MAP: Array<{ url: string; name: string }> = [
+  { url: RSS_FEEDS.CRYPTOSLATE,       name: SOURCE_NAMES.CRYPTOSLATE },
+  { url: RSS_FEEDS.COINTELEGRAPH,     name: SOURCE_NAMES.COINTELEGRAPH },
+  { url: RSS_FEEDS.COINDESK,          name: SOURCE_NAMES.COINDESK },
+  { url: RSS_FEEDS.THE_BLOCK,         name: SOURCE_NAMES.THE_BLOCK },
+  { url: RSS_FEEDS.DECRYPT,           name: SOURCE_NAMES.DECRYPT },
+  { url: RSS_FEEDS.BLEEPING_COMPUTER, name: SOURCE_NAMES.BLEEPING_COMPUTER },
+  { url: RSS_FEEDS.BITCOIN_MAGAZINE,  name: SOURCE_NAMES.BITCOIN_MAGAZINE },
+  { url: RSS_FEEDS.CRYPTONEWS,        name: SOURCE_NAMES.CRYPTONEWS },
+];
+
 /**
  * Collect articles from all configured RSS feeds.
- * Returns raw articles that match physical attack keywords.
+ * Returns raw articles that pass dual-group keyword matching.
  */
 export async function collectFromRSS(): Promise<RawArticle[]> {
-  logger.info('Starting RSS collection');
+  logger.info('Starting RSS collection', { feedCount: FEED_MAP.length });
 
   const allArticles: RawArticle[] = [];
+  const perSourceCounts: Record<string, number> = {};
 
-  // Fetch CryptoSlate
-  const cryptoslateArticles = await fetchFeed(
-    RSS_FEEDS.CRYPTOSLATE,
-    SOURCE_NAMES.CRYPTOSLATE
-  );
-  allArticles.push(...cryptoslateArticles);
+  for (const feed of FEED_MAP) {
+    const articles = await fetchFeed(feed.url, feed.name);
+    allArticles.push(...articles);
+    perSourceCounts[feed.name] = articles.length;
 
-  // Rate limit between feeds
-  await sleep(RATE_LIMITS.RSS_DELAY_MS);
-
-  // Fetch CoinTelegraph
-  const cointelegraphArticles = await fetchFeed(
-    RSS_FEEDS.COINTELEGRAPH,
-    SOURCE_NAMES.COINTELEGRAPH
-  );
-  allArticles.push(...cointelegraphArticles);
+    // Respect rate limits between feeds
+    await sleep(RATE_LIMITS.RSS_DELAY_MS);
+  }
 
   logger.info('RSS collection complete', {
     totalArticles: allArticles.length,
-    sources: {
-      [SOURCE_NAMES.CRYPTOSLATE]: cryptoslateArticles.length,
-      [SOURCE_NAMES.COINTELEGRAPH]: cointelegraphArticles.length,
-    },
+    perSource: perSourceCounts,
   });
 
   return allArticles;

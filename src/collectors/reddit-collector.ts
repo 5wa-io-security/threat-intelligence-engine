@@ -9,7 +9,7 @@ import {
   REDDIT_SEARCH_QUERIES,
   SOURCE_NAMES,
   RATE_LIMITS,
-  PHYSICAL_ATTACK_KEYWORDS,
+  matchesDualGroupKeywords,
 } from '../utils/constants.js';
 
 const logger = createLogger('reddit-collector');
@@ -58,30 +58,11 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Secondary filter: verify post content actually relates to physical attacks.
+ * Secondary filter: verify post content actually relates to physical crypto attacks.
+ * Uses dual-group matching: must have physical threat + crypto context keywords.
  */
 function isPhysicalAttackRelated(title: string, content: string): boolean {
-  const combinedText = `${title} ${content}`.toLowerCase();
-
-  // Exclude posts that are clearly about hacks/exploits only
-  const exclusionKeywords = [
-    'smart contract exploit',
-    'defi hack',
-    'bridge hack',
-    'flash loan',
-    'rug pull',
-    'protocol vulnerability',
-  ];
-
-  if (exclusionKeywords.some((kw) => combinedText.includes(kw))) {
-    // Only exclude if NO physical attack keywords are present
-    const hasPhysical = PHYSICAL_ATTACK_KEYWORDS.some((kw) =>
-      combinedText.includes(kw.toLowerCase())
-    );
-    if (!hasPhysical) return false;
-  }
-
-  return true;
+  return matchesDualGroupKeywords(`${title} ${content}`);
 }
 
 // ─── Reddit API ──────────────────────────────────────────────────────────────
