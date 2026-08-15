@@ -4,8 +4,8 @@
  * Collection pipeline:
  *   1. Fetch data from all sources (RSS feeds, Google News, Reddit, Lopp list)
  *   2. Parse and structure the raw data
- *   3. Deduplicate (in-memory cross-source → URL → semantic)
- *   4. Store new incidents in Supabase
+ *   3. Enrich incidents with LLM classification when configured
+ *   4. Deduplicate (in-memory cross-source → URL → semantic) and store in Supabase
  *
  * @see https://github.com/5wa-io-security/threat-intelligence-engine
  */
@@ -20,6 +20,7 @@ import { collectFromLoppList } from './collectors/lopp-list-collector.js';
 import { parseIncidents } from './parsers/incident-parser.js';
 import { testConnection } from './database/supabase-client.js';
 import { batchInsertIncidents, getIncidentCount } from './database/operations.js';
+import { enrichWithLLM } from './llm/classifier.js';
 
 const logger = createLogger('main');
 
@@ -121,7 +122,7 @@ async function runPipeline(): Promise<CollectionStats> {
     ...redditPosts,
     ...loppEntries,
   ];
-  const incidents = parseIncidents(allRawInputs);
+  let incidents = parseIncidents(allRawInputs);
   stats.totalParsed = incidents.length;
 
   logger.info('Parsing complete', { parsed: stats.totalParsed });
@@ -130,6 +131,24 @@ async function runPipeline(): Promise<CollectionStats> {
     logger.warn('No incidents parsed. Pipeline ending early.');
     stats.durationMs = Date.now() - startTime;
     return stats;
+  }
+
+  // ─── Step 3.5: Optional LLM Enrichment ──────────────────────────────────
+  if (process.env.GROQ_API_KEY?.trim()) {
+    logger.info('Step 3.5/4: Enriching incidents with LLM classification...');
+
+    try {
+      incidents = await enrichWithLLM(incidents);
+    } catch (error) {
+      // Per-incident failures are already handled inside enrichWithLLM. This
+      // outer guard ensures an unexpected layer-level failure never stops the
+      // collection pipeline or discards heuristic results.
+      logger.warn('LLM enrichment layer failed; continuing with heuristic data', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  } else {
+    logger.info('Step 3.5/4: LLM enrichment skipped (GROQ_API_KEY not set)');
   }
 
   // ─── Step 4: Deduplicate and Store in Database ───────────────────────────

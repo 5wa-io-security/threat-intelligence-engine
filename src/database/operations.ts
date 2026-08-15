@@ -39,6 +39,10 @@ export interface ThreatIncident {
   description: string;
   raw_content: string;
   tags: string[];
+  severity: number | null;
+  ai_summary: string | null;
+  confidence_score: number | null;
+  llm_model: string | null;
 }
 
 export interface ThreatIncidentRow extends ThreatIncident {
@@ -201,7 +205,9 @@ export async function filterNewIncidents(incidents: ThreatIncident[]): Promise<T
     return incidents;
   }
 
-  const existingUrls = new Set((data ?? []).map((row) => row.source_url));
+  const existingUrls = new Set(
+    (data ?? []).map((row: { source_url: string }) => row.source_url)
+  );
   const newIncidents = incidents.filter((i) => !existingUrls.has(i.source_url));
 
   logger.info('URL deduplication complete', {

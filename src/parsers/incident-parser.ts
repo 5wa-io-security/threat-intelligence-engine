@@ -235,6 +235,10 @@ export function parseIncident(raw: RawInput): ThreatIncident {
     description: description.slice(0, 1000),
     raw_content: raw.content.slice(0, 10000),
     tags,
+    severity: null,
+    ai_summary: null,
+    confidence_score: null,
+    llm_model: null,
   };
 
   logger.debug('Parsed incident', {

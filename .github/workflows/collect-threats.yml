@@ -26,8 +26,8 @@ jobs:
   collect:
     name: Run Threat Intelligence Collection
     runs-on: ubuntu-latest
-    # Increased to 20 min to accommodate 8 RSS feeds + Google News (10 queries) + Reddit
-    timeout-minutes: 20
+    # Allows collection plus sequential LLM enrichment at the 30 RPM Groq limit
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -46,6 +46,8 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OLLAMA_URL: ${{ secrets.OLLAMA_URL }}
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
         run: npm run collect
 
