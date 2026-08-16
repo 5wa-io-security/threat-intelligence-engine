@@ -430,6 +430,10 @@ const US_STATES: string[] = [
  * Get coordinates for a city or country with small random offset to prevent overlap.
  */
 export function getCoordinates(country: string, city: string | null): { latitude: number; longitude: number } | null {
+  // Only return coordinates if we have a specific city - never use country center points
+  if (!city || !CITY_COORDS[city]) {
+    return null;
+  }
   let baseLat: number;
   let baseLng: number;
 
@@ -442,8 +446,8 @@ export function getCoordinates(country: string, city: string | null): { latitude
   }
 
   // Add small random offset (±0.3 degrees) to prevent exact overlap
-  const latOffset = (Math.random() - 0.5) * 0.6;
-  const lngOffset = (Math.random() - 0.5) * 0.6;
+  const latOffset = (Math.random() - 0.5) * 0.1;
+  const lngOffset = (Math.random() - 0.5) * 0.1;
 
   return {
     latitude: Math.round((baseLat + latOffset) * 10000) / 10000,
