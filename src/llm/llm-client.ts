@@ -1,16 +1,19 @@
 import { createLogger } from '../utils/logger.js';
+import {
+  DEFAULT_GROQ_BASE_URL,
+  DEFAULT_GROQ_MODEL,
+  DEFAULT_OLLAMA_MODEL,
+  type LLMConfig,
+  getConfiguredProviders,
+  loadLLMConfig,
+} from './config.js';
 
 const logger = createLogger('llm-client');
 
-export const GROQ_BASE_URL = 'https://api.groq.com/openai/v1';
-export const GROQ_MODEL = 'llama-3.1-8b-instant';
-export const OLLAMA_MODEL = 'llama3.1:8b';
-
-const GROQ_MIN_REQUEST_INTERVAL_MS = 2_000;
-const REQUEST_TIMEOUT_MS = 30_000;
-const MAX_ATTEMPTS = 3;
-const MAX_RETRY_DELAY_MS = 30_000;
-const MAX_COMPLETION_TOKENS = 300;
+// Backward-compatible exports for callers that imported the original constants.
+export const GROQ_BASE_URL = DEFAULT_GROQ_BASE_URL;
+export const GROQ_MODEL = DEFAULT_GROQ_MODEL;
+export const OLLAMA_MODEL = DEFAULT_OLLAMA_MODEL;
 
 interface ChatMessage {
   role: 'system' | 'user';
@@ -24,6 +27,13 @@ interface ChatCompletionResponse {
       content?: unknown;
     };
   }>;
+  usage?: Record<string, unknown>;
+  total_duration?: unknown;
+  load_duration?: unknown;
+  prompt_eval_count?: unknown;
+  eval_count?: unknown;
+  prompt_eval_duration?: unknown;
+  eval_duration?: unknown;
 }
 
 interface ErrorResponse {
@@ -36,9 +46,33 @@ export interface LLMCompletion<T = string> {
   content: T;
   model: string;
   provider: 'groq' | 'ollama';
+  latencyMs?: number;
+  usage?: LLMUsage;
+}
+
+export interface LLMProviderHealth {
+  provider: 'groq' | 'ollama';
+  model: string;
+  reachable: boolean;
+  modelAvailable: boolean | null;
+  latencyMs: number | null;
+  error?: string;
+}
+
+export interface LLMUsage {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  totalDurationMs?: number;
+  loadDurationMs?: number;
+  promptEvalCount?: number;
+  evalCount?: number;
+  promptEvalDurationMs?: number;
+  evalDurationMs?: number;
 }
 
 export interface LLMClientOptions {
+  config?: Partial<LLMConfig>;
   groqApiKey?: string;
   ollamaUrl?: string;
   fetchImpl?: typeof fetch;
@@ -64,6 +98,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function optionalString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
 function buildChatCompletionsUrl(baseUrl: string): string {
   const trimmed = baseUrl.trim().replace(/\/+$/, '');
 
@@ -78,17 +117,31 @@ function buildChatCompletionsUrl(baseUrl: string): string {
   return `${trimmed}/v1/chat/completions`;
 }
 
-function parseRetryAfter(value: string | null, now: () => number): number | undefined {
+function buildModelsUrl(baseUrl: string): string {
+  const chatCompletionsUrl = buildChatCompletionsUrl(baseUrl);
+  return chatCompletionsUrl.replace(/\/chat\/completions$/, '/models');
+}
+
+function extractModelIds(payload: unknown): string[] {
+  if (!isRecord(payload) || !Array.isArray(payload.data)) return [];
+
+  return payload.data.flatMap((item) => {
+    if (!isRecord(item) || typeof item.id !== 'string') return [];
+    return [item.id];
+  });
+}
+
+function parseRetryAfter(value: string | null, now: () => number, maxDelayMs: number): number | undefined {
   if (!value) return undefined;
 
   const seconds = Number(value);
   if (Number.isFinite(seconds) && seconds >= 0) {
-    return Math.min(seconds * 1_000, MAX_RETRY_DELAY_MS);
+    return Math.min(seconds * 1_000, maxDelayMs);
   }
 
   const dateMs = Date.parse(value);
   if (Number.isFinite(dateMs)) {
-    return Math.min(Math.max(0, dateMs - now()), MAX_RETRY_DELAY_MS);
+    return Math.min(Math.max(0, dateMs - now()), maxDelayMs);
   }
 
   return undefined;
@@ -109,7 +162,40 @@ function getErrorMessage(payload: unknown, fallback: string): string {
   return error.message;
 }
 
-function getCompletionContent(payload: unknown): { content: string; model?: string } {
+function nonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function nanosecondsToMilliseconds(value: unknown): number | undefined {
+  const number = nonNegativeNumber(value);
+  return number === undefined ? undefined : Math.round(number / 1_000_000);
+}
+
+function parseUsage(payload: unknown): LLMUsage | undefined {
+  if (!isRecord(payload)) return undefined;
+
+  const response = payload as ChatCompletionResponse;
+  const usage = isRecord(response.usage) ? response.usage : undefined;
+  const parsed: LLMUsage = {
+    promptTokens: nonNegativeNumber(usage?.prompt_tokens),
+    completionTokens: nonNegativeNumber(usage?.completion_tokens),
+    totalTokens: nonNegativeNumber(usage?.total_tokens),
+    totalDurationMs: nanosecondsToMilliseconds(response.total_duration),
+    loadDurationMs: nanosecondsToMilliseconds(response.load_duration),
+    promptEvalCount: nonNegativeNumber(response.prompt_eval_count),
+    evalCount: nonNegativeNumber(response.eval_count),
+    promptEvalDurationMs: nanosecondsToMilliseconds(response.prompt_eval_duration),
+    evalDurationMs: nanosecondsToMilliseconds(response.eval_duration),
+  };
+
+  return Object.values(parsed).some((value) => value !== undefined) ? parsed : undefined;
+}
+
+function getCompletionContent(payload: unknown): {
+  content: string;
+  model?: string;
+  usage?: LLMUsage;
+} {
   if (!isRecord(payload)) {
     throw new Error('LLM response was not a JSON object');
   }
@@ -124,6 +210,7 @@ function getCompletionContent(payload: unknown): { content: string; model?: stri
   return {
     content: content.trim(),
     model: typeof response.model === 'string' ? response.model : undefined,
+    usage: parseUsage(payload),
   };
 }
 
@@ -132,22 +219,131 @@ async function defaultSleep(milliseconds: number): Promise<void> {
 }
 
 export class LLMClient {
-  private readonly groqApiKey: string | undefined;
-  private readonly ollamaUrl: string | undefined;
+  private readonly config: LLMConfig;
   private readonly fetchImpl: typeof fetch;
   private readonly sleep: (milliseconds: number) => Promise<void>;
   private readonly now: () => number;
-  private readonly requestTimeoutMs: number;
   private lastGroqRequestAt: number | null = null;
-  private groqDisabledForRun = false;
+  private readonly disabledProviders = new Set<'groq' | 'ollama'>();
 
   constructor(options: LLMClientOptions = {}) {
-    this.groqApiKey = options.groqApiKey?.trim() || process.env.GROQ_API_KEY?.trim();
-    this.ollamaUrl = options.ollamaUrl?.trim() || process.env.OLLAMA_URL?.trim();
+    const environmentConfig = loadLLMConfig();
+    const configuredOverrides = options.config ?? {};
+
+    this.config = {
+      ...environmentConfig,
+      ...configuredOverrides,
+      groqApiKey: optionalString(
+        options.groqApiKey ?? configuredOverrides.groqApiKey ?? environmentConfig.groqApiKey
+      ),
+      ollamaUrl: optionalString(
+        options.ollamaUrl ?? configuredOverrides.ollamaUrl ?? environmentConfig.ollamaUrl
+      ),
+      requestTimeoutMs: options.requestTimeoutMs ??
+        configuredOverrides.requestTimeoutMs ?? environmentConfig.requestTimeoutMs,
+    };
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.sleep = options.sleep ?? defaultSleep;
     this.now = options.now ?? Date.now;
-    this.requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+  }
+
+  async checkHealth(): Promise<LLMProviderHealth[]> {
+    const providers = getConfiguredProviders(this.config).filter(
+      (provider) => !this.disabledProviders.has(provider)
+    );
+
+    const healthResults: LLMProviderHealth[] = [];
+    for (const provider of providers) {
+      healthResults.push(await this.checkProviderHealth(provider));
+    }
+
+    return healthResults;
+  }
+
+  private async checkProviderHealth(
+    provider: 'groq' | 'ollama'
+  ): Promise<LLMProviderHealth> {
+    const isGroq = provider === 'groq';
+    const model = isGroq ? this.config.groqModel : this.config.ollamaModel;
+    const baseUrl = isGroq ? this.config.groqBaseUrl : this.config.ollamaUrl;
+    const startedAt = this.now();
+
+    if (!baseUrl) {
+      return {
+        provider,
+        model,
+        reachable: false,
+        modelAvailable: false,
+        latencyMs: null,
+        error: `${provider} is not configured`,
+      };
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+
+    try {
+      const headers: Record<string, string> = {};
+      if (isGroq && this.config.groqApiKey) {
+        headers.Authorization = `Bearer ${this.config.groqApiKey}`;
+      } else if (!isGroq && this.config.ollamaApiKey) {
+        headers.Authorization = `Bearer ${this.config.ollamaApiKey}`;
+      }
+
+      const response = await this.fetchImpl(buildModelsUrl(baseUrl), {
+        method: 'GET',
+        headers,
+        signal: controller.signal,
+      });
+      const responseText = await response.text();
+      let payload: unknown = {};
+
+      try {
+        payload = responseText === '' ? {} : JSON.parse(responseText);
+      } catch {
+        throw new Error(`${provider} health endpoint returned non-JSON content`);
+      }
+
+      if (!response.ok) {
+        throw new ProviderRequestError(
+          getErrorMessage(payload, `${provider} health check failed with HTTP ${response.status}`),
+          provider,
+          response.status,
+          undefined,
+          false
+        );
+      }
+
+      const modelIds = extractModelIds(payload);
+      const modelAvailable = modelIds.length === 0 ? null : modelIds.includes(model);
+
+      if (modelAvailable === false) {
+        this.disabledProviders.add(provider);
+      }
+
+      return {
+        provider,
+        model,
+        reachable: true,
+        modelAvailable,
+        latencyMs: Math.max(0, this.now() - startedAt),
+        error: modelAvailable === false ? `Model ${model} is not available` : undefined,
+      };
+    } catch (error) {
+      this.disabledProviders.add(provider);
+      const message = error instanceof Error ? error.message : String(error);
+
+      return {
+        provider,
+        model,
+        reachable: false,
+        modelAvailable: false,
+        latencyMs: Math.max(0, this.now() - startedAt),
+        error: message,
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async completeJson<T = string>(
@@ -160,54 +356,52 @@ export class LLMClient {
       { role: 'user', content: userPrompt },
     ];
 
-    let groqError: unknown;
+    const configuredProviders = getConfiguredProviders(this.config);
+    const providers = configuredProviders.filter(
+      (provider) => !this.disabledProviders.has(provider)
+    );
 
-    if (this.groqApiKey && !this.groqDisabledForRun) {
+    if (providers.length === 0) {
+      if (configuredProviders.length > 0) {
+        throw new Error('All configured LLM providers are unavailable');
+      }
+
+      throw new Error(
+        this.config.providerMode === 'groq'
+          ? 'LLM_PROVIDER=groq requires GROQ_API_KEY'
+          : this.config.providerMode === 'ollama'
+            ? 'LLM_PROVIDER=ollama requires OLLAMA_URL'
+            : 'No LLM provider is configured'
+      );
+    }
+
+    const errors: string[] = [];
+
+    for (const provider of providers) {
       try {
-        const completion = await this.requestWithRetries({
-          provider: 'groq',
-          url: `${GROQ_BASE_URL}/chat/completions`,
-          model: GROQ_MODEL,
-          apiKey: this.groqApiKey,
-          messages,
-        });
+        const completion = await this.requestWithRetries(provider, messages);
         return this.parseCompletion(completion, parseResponse);
       } catch (error) {
-        groqError = error;
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`${provider}: ${message}`);
 
         if (
+          provider === 'groq' &&
           error instanceof ProviderRequestError &&
           (error.status === 401 || error.status === 403)
         ) {
-          this.groqDisabledForRun = true;
+          this.disabledProviders.add('groq');
           logger.warn('Groq authentication failed; disabling Groq for the rest of this run');
         } else {
-          logger.warn('Groq request failed; checking optional Ollama fallback', {
-            error: error instanceof Error ? error.message : String(error),
+          logger.warn('LLM provider failed; checking the next configured provider', {
+            provider,
+            error: message,
           });
         }
       }
     }
 
-    if (this.ollamaUrl) {
-      const completion = await this.requestWithRetries({
-        provider: 'ollama',
-        url: buildChatCompletionsUrl(this.ollamaUrl),
-        model: OLLAMA_MODEL,
-        messages,
-      });
-      return this.parseCompletion(completion, parseResponse);
-    }
-
-    if (groqError instanceof Error) {
-      throw groqError;
-    }
-
-    if (!this.groqApiKey) {
-      throw new Error('No LLM provider is configured');
-    }
-
-    throw new Error('Groq is unavailable and OLLAMA_URL is not configured');
+    throw new Error(`All configured LLM providers failed: ${errors.join(' | ')}`);
   }
 
   private parseCompletion<T>(
@@ -222,38 +416,38 @@ export class LLMClient {
     };
   }
 
-  private async requestWithRetries(input: {
-    provider: 'groq' | 'ollama';
-    url: string;
-    model: string;
-    apiKey?: string;
-    messages: ChatMessage[];
-  }): Promise<LLMCompletion<string>> {
+  private async requestWithRetries(
+    provider: 'groq' | 'ollama',
+    messages: ChatMessage[]
+  ): Promise<LLMCompletion<string>> {
     let lastError: unknown;
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= this.config.maxAttempts; attempt++) {
       try {
-        if (input.provider === 'groq') {
+        if (provider === 'groq') {
           await this.throttleGroq();
         }
 
-        return await this.sendRequest(input);
+        return await this.sendRequest(provider, messages);
       } catch (error) {
         lastError = error;
         const retryable =
           error instanceof ProviderRequestError ? error.retryable : true;
 
-        if (!retryable || attempt === MAX_ATTEMPTS) {
+        if (!retryable || attempt === this.config.maxAttempts) {
           break;
         }
 
-        const exponentialDelay = Math.min(1_000 * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS);
+        const exponentialDelay = Math.min(
+          1_000 * 2 ** (attempt - 1),
+          this.config.maxRetryDelayMs
+        );
         const retryAfterMs =
           error instanceof ProviderRequestError ? error.retryAfterMs ?? 0 : 0;
         const delayMs = Math.max(exponentialDelay, retryAfterMs);
 
         logger.warn('Transient LLM request failure; retrying', {
-          provider: input.provider,
+          provider,
           attempt,
           nextAttempt: attempt + 1,
           delayMs,
@@ -267,52 +461,65 @@ export class LLMClient {
       throw lastError;
     }
 
-    throw new Error(`${input.provider} request failed`);
+    throw new Error(`${provider} request failed`);
   }
 
   private async throttleGroq(): Promise<void> {
     if (this.lastGroqRequestAt !== null) {
       const elapsed = this.now() - this.lastGroqRequestAt;
-      if (elapsed < GROQ_MIN_REQUEST_INTERVAL_MS) {
-        await this.sleep(GROQ_MIN_REQUEST_INTERVAL_MS - elapsed);
+      if (elapsed < this.config.groqMinRequestIntervalMs) {
+        await this.sleep(this.config.groqMinRequestIntervalMs - elapsed);
       }
     }
 
     this.lastGroqRequestAt = this.now();
   }
 
-  private async sendRequest(input: {
-    provider: 'groq' | 'ollama';
-    url: string;
-    model: string;
-    apiKey?: string;
-    messages: ChatMessage[];
-  }): Promise<LLMCompletion<string>> {
+  private async sendRequest(
+    provider: 'groq' | 'ollama',
+    messages: ChatMessage[]
+  ): Promise<LLMCompletion<string>> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    const startedAt = this.now();
+    const timeout = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+    const isGroq = provider === 'groq';
+    const model = isGroq ? this.config.groqModel : this.config.ollamaModel;
+    const baseUrl = isGroq ? this.config.groqBaseUrl : this.config.ollamaUrl;
+
+    if (!baseUrl) {
+      throw new ProviderRequestError(
+        `${provider} is not configured`,
+        provider,
+        undefined,
+        undefined,
+        false
+      );
+    }
 
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
       };
-      if (input.apiKey) {
-        headers.Authorization = `Bearer ${input.apiKey}`;
+      if (isGroq && this.config.groqApiKey) {
+        headers.Authorization = `Bearer ${this.config.groqApiKey}`;
+      } else if (!isGroq && this.config.ollamaApiKey) {
+        headers.Authorization = `Bearer ${this.config.ollamaApiKey}`;
       }
 
       const body: Record<string, unknown> = {
-        model: input.model,
-        messages: input.messages,
+        model,
+        messages,
         temperature: 0.1,
         response_format: { type: 'json_object' },
       };
 
-      if (input.provider === 'groq') {
-        body.max_completion_tokens = MAX_COMPLETION_TOKENS;
+      if (isGroq) {
+        body.max_completion_tokens = this.config.maxCompletionTokens;
       } else {
-        body.max_tokens = MAX_COMPLETION_TOKENS;
+        body.max_tokens = this.config.maxCompletionTokens;
       }
 
-      const response = await this.fetchImpl(input.url, {
+      const response = await this.fetchImpl(buildChatCompletionsUrl(baseUrl), {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
@@ -326,8 +533,8 @@ export class LLMClient {
         payload = responseText === '' ? {} : JSON.parse(responseText);
       } catch {
         throw new ProviderRequestError(
-          `${input.provider} returned non-JSON content`,
-          input.provider,
+          `${provider} returned non-JSON content`,
+          provider,
           response.status,
           undefined,
           response.status >= 500
@@ -335,23 +542,27 @@ export class LLMClient {
       }
 
       if (!response.ok) {
-        const fallback = `${input.provider} request failed with HTTP ${response.status}`;
+        const fallback = `${provider} request failed with HTTP ${response.status}`;
         throw new ProviderRequestError(
           getErrorMessage(payload, fallback),
-          input.provider,
+          provider,
           response.status,
-          parseRetryAfter(response.headers.get('retry-after'), this.now),
+          parseRetryAfter(
+            response.headers.get('retry-after'),
+            this.now,
+            this.config.maxRetryDelayMs
+          ),
           isRetryableStatus(response.status)
         );
       }
 
-      let parsed: { content: string; model?: string };
+      let parsed: { content: string; model?: string; usage?: LLMUsage };
       try {
         parsed = getCompletionContent(payload);
       } catch (error) {
         throw new ProviderRequestError(
           error instanceof Error ? error.message : String(error),
-          input.provider,
+          provider,
           response.status,
           undefined,
           false
@@ -360,8 +571,10 @@ export class LLMClient {
 
       return {
         content: parsed.content,
-        model: parsed.model ?? input.model,
-        provider: input.provider,
+        model: parsed.model ?? model,
+        provider,
+        latencyMs: Math.max(0, this.now() - startedAt),
+        usage: parsed.usage,
       };
     } catch (error) {
       if (error instanceof ProviderRequestError) {
@@ -371,9 +584,9 @@ export class LLMClient {
       const isTimeout = error instanceof Error && error.name === 'AbortError';
       throw new ProviderRequestError(
         isTimeout
-          ? `${input.provider} request timed out after ${this.requestTimeoutMs} ms`
-          : `${input.provider} network request failed: ${error instanceof Error ? error.message : String(error)}`,
-        input.provider,
+          ? `${provider} request timed out after ${this.config.requestTimeoutMs} ms`
+          : `${provider} network request failed: ${error instanceof Error ? error.message : String(error)}`,
+        provider,
         undefined,
         undefined,
         true

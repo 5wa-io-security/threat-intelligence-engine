@@ -1,97 +1,115 @@
-# 5WA Threat Intelligence Engine — Groq LLM Integration
+# 5WA Threat Intelligence Engine — LLM Integration
 
 **Author:** Manus AI  
-**Prepared:** 2026-08-15
+**Prepared:** 2026-09-09
 
-This commit package adds a feature-gated **Step 3.5** after heuristic incident parsing and before the existing deduplication/storage stage. Each incident can now receive a validated severity score, corrected attack/victim classification, concise AI summary, relevance confidence, and the model identifier that produced the result.
+This integration adds a feature-gated **Step 3.5** after heuristic incident parsing and before the existing deduplication/storage stage. Each incident can receive a validated severity score, corrected attack/victim classification, concise AI summary, relevance confidence, and the model identifier that produced the result.
 
-Groq’s official model documentation confirms that `llama-3.1-8b-instant` supports JSON mode, and the chat-completions API accepts `response_format: {"type":"json_object"}`.[1] [2] The implementation deliberately uses JSON Object Mode rather than strict JSON Schema because Groq’s current Structured Outputs documentation lists strict schema support only for selected GPT-OSS models, while directing other models to JSON Object Mode.[3]
+> **Important model update:** Groq’s deprecation page lists `llama-3.1-8b-instant` with a shutdown date of **2026-08-16** and recommends `openai/gpt-oss-20b` as its replacement.[1] The current implementation therefore uses `openai/gpt-oss-20b` by default and keeps the model configurable through `GROQ_MODEL`.
+
+Groq’s API supports the OpenAI-compatible chat-completions endpoint and JSON output. Ollama’s official OpenAI compatibility documentation supports `/v1/chat/completions`, JSON mode, `/v1/models`, and `max_tokens` for local model serving.[2] [3]
 
 ## Included files
 
 | Path | Action | Purpose |
 | --- | --- | --- |
-| `src/llm/llm-client.ts` | Add | Native-fetch Groq client, optional Ollama fallback, timeout, retries, `Retry-After`, and two-second Groq throttle |
-| `src/llm/classifier.ts` | Add | Runtime output validation, per-incident enrichment, tag synchronization, and graceful failure |
+| `src/llm/config.ts` | Add | Typed provider/model configuration, validation, and provider selection |
+| `src/llm/llm-client.ts` | Replace | Native-fetch Groq client, optional Ollama fallback, health check, retries, usage metadata, and throttling |
+| `src/llm/classifier.ts` | Replace | Runtime output validation, per-incident enrichment, tag synchronization, aggregate metrics, and graceful failure |
 | `src/llm/prompts.ts` | Add | Concise scoring, classification, summary, and relevance prompts |
-| `src/llm/llm-client.test.ts` | Add | Mocked request, throttling, retry, and Ollama fallback tests |
+| `src/llm/config.test.ts` | Add | Configuration, model defaults, provider modes, and URL validation tests |
+| `src/llm/llm-client.test.ts` | Replace | Request shape, throttling, retries, health check, Ollama-only mode, fallback, and usage tests |
 | `src/llm/classifier.test.ts` | Add | Parsing, classification, tagging, and graceful-failure tests |
-| `src/index.ts` | Replace | Adds feature-gated Step 3.5 before deduplication/storage |
-| `src/database/operations.ts` | Replace | Adds four nullable fields to `ThreatIncident` and one explicit query-row type |
+| `src/llm/quality-fixtures.ts` | Add | Redacted deterministic enrichment fixtures for regression checks |
+| `src/index.ts` | Replace | Adds provider-aware Step 3.5 and configuration warnings |
+| `src/database/operations.ts` | Replace | Adds four nullable enrichment fields to `ThreatIncident` |
 | `src/parsers/incident-parser.ts` | Replace | Initializes all LLM fields to `null` |
-| `.github/workflows/collect-threats.yml` | Replace | Injects Groq/Ollama secrets and raises timeout to 60 minutes |
-| `.env.example` | Add or merge | Documents LLM variables without credentials |
+| `.github/workflows/collect-threats.yml` | Replace | Injects provider secrets and provides enough timeout for sequential processing |
+| `.env.example` | Replace or merge | Documents all LLM variables without credentials |
 | `supabase/migrations/20260815000000_add_llm_enrichment_columns.sql` | Add | Adds four nullable Supabase columns |
-| `package.json` | Replace | Adds `npm test`; no dependency is added |
-| `VALIDATION.md` | Add | Records completed static and mocked-provider checks |
+| `package.json` | Replace | Adds `npm test`; no new runtime dependency |
+| `INDEPENDENT_DEVELOPMENT_AUDIT.md` | Add | Records the independent-development boundary and current compatibility findings |
+| `VALIDATION.md` | Add or update | Records static and mocked-provider validation |
 
-## Installation
+## Provider modes
 
-Extract the archive at the repository root so the included paths merge into the existing project. If your current `.env.example` contains additional project-specific variables, merge the four relevant entries instead of discarding those existing lines.
+`LLM_PROVIDER=auto` is the default. It tries Groq first and then Ollama if Groq fails. Set `LLM_PROVIDER=groq` to use Groq only, or `LLM_PROVIDER=ollama` to run locally on the Jetson without a Groq key. The pipeline enables Step 3.5 whenever at least one configured provider has a valid HTTP or HTTPS endpoint.
 
-Apply the database migration **before** enabling the workflow secret. With Supabase CLI, run:
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `LLM_PROVIDER` | `auto` | `auto`, `groq`, or `ollama` |
+| `GROQ_API_KEY` | empty | Groq credential; keep it in GitHub Secrets |
+| `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Groq-compatible API base URL |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` | Current Groq model default; override only after testing |
+| `OLLAMA_URL` | empty | Base URL such as `http://127.0.0.1:11434` |
+| `OLLAMA_API_KEY` | empty | Optional Bearer token for an authenticated gateway |
+| `OLLAMA_MODEL` | `llama3.1:8b` | Local model tag; can be a quantized/custom model name |
+| `LLM_REQUEST_TIMEOUT_MS` | `30000` | Per-request timeout |
+| `LLM_MAX_ATTEMPTS` | `3` | Maximum attempts per provider request |
+| `LLM_MAX_RETRY_DELAY_MS` | `30000` | Upper bound for retry backoff |
+| `LLM_MAX_COMPLETION_TOKENS` | `300` | Output token budget |
+| `LLM_MIN_CONFIDENCE` | `0.65` | Minimum `confidence_score` required before LLM fields replace heuristic values |
+| `GROQ_MIN_REQUEST_INTERVAL_MS` | `2000` | Minimum interval between Groq request starts |
+
+## Health check and failure behavior
+
+Before processing incidents, the default client performs one `GET /v1/models` preflight request for each configured provider. It checks endpoint reachability and, when the endpoint returns model IDs, verifies the configured model. An unavailable provider is disabled for the remainder of that run, preventing a stopped Jetson from causing a timeout for every incident.
+
+The health check is observability only. The normal completion path still performs provider fallback and runtime JSON validation. If every provider fails, the original heuristic incident is preserved and the pipeline continues. No prompt, raw article content, API key, or full model response is written to logs.
+
+The confidence gate provides a second, provider-independent safety boundary. A valid JSON response whose `confidence_score` is below `LLM_MIN_CONFIDENCE` is treated as a failed enrichment: the original heuristic incident is returned unchanged, including its nullable LLM fields. The default is `0.65`; raise it for conservative production operation or set it to `0` when intentionally accepting every schema-valid model result.
+
+Do not expose an unauthenticated Ollama port directly to the public Internet. Keep plain HTTP on localhost or a private VPN, or place the endpoint behind HTTPS and authentication. The configuration layer emits a warning whenever `OLLAMA_URL` uses plain HTTP.
+
+## Usage and cost observability
+
+Successful completions record provider, model, request latency, and available token counts in aggregate workflow logs. Groq usage is read from `usage.prompt_tokens`, `usage.completion_tokens`, and `usage.total_tokens`. Ollama usage is normalized from `prompt_eval_count`, `eval_count`, and duration fields. This makes monthly cost estimation possible without storing article content.
+
+For a provider priced per token, calculate:
+
+```text
+monthly_cost = monthly_prompt_tokens / 1,000,000 * input_price
+              + monthly_completion_tokens / 1,000,000 * output_price
+```
+
+Prices change, so do not hard-code cost figures into incident records. Read the current provider pricing page when calculating the monthly estimate. Groq’s rate-limit documentation also describes HTTP 429 behavior and the `retry-after` header, which the client honors.[4]
+
+## Installation and validation
+
+Extract the package at the repository root so the included paths merge into the existing project. If your current `.env.example` contains additional project-specific variables, merge the new entries rather than replacing existing lines.
+
+Apply the Supabase migration before enabling enrichment:
 
 ```bash
 supabase db push
 ```
 
-Alternatively, execute the contents of `supabase/migrations/20260815000000_add_llm_enrichment_columns.sql` once in the Supabase SQL Editor.
-
-## Secret setup
-
-The Groq key included in the original request was exposed in plaintext. **Revoke it and create a replacement key before deployment.** Do not put the replacement in source code, `.env.example`, logs, or workflow YAML.
-
-In GitHub, open **Settings → Secrets and variables → Actions → New repository secret**, then create:
-
-| Secret | Required | Value |
-| --- | --- | --- |
-| `GROQ_API_KEY` | Yes for Step 3.5 | Newly rotated Groq API key |
-| `OLLAMA_URL` | No | Base server URL such as `http://host:11434`; leave absent if no fallback is available |
-
-The workflow already maps these repository secrets into the collector process. An absent `GROQ_API_KEY` skips Step 3.5 and keeps the existing heuristic-only pipeline. An absent `OLLAMA_URL` silently disables only the fallback path.
-
-## Validation before push
-
-Run the project’s normal installation and checks from the repository root:
+Then run:
 
 ```bash
 npm ci
 npm test
+npm run llm:quality
 npm run typecheck
 npm run build
 ```
 
-Then test locally with a newly rotated key. In Windows PowerShell, use semicolons rather than Bash `&&`:
+For local Ollama-only validation, configure:
 
-```powershell
-$env:GROQ_API_KEY="your-rotated-key"; $env:LOG_LEVEL="debug"; npm run collect
+```bash
+LLM_PROVIDER=ollama
+OLLAMA_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=llama3.1:8b
+npm run collect
 ```
 
-To exercise Ollama fallback locally, add:
+For GitHub Actions, store `GROQ_API_KEY` as a repository secret. Store `OLLAMA_URL` only if a secure private route from the runner to the Jetson exists. Do not use a private LAN address that the GitHub-hosted runner cannot reach, and do not publish port `11434` without authentication and network controls.
 
-```powershell
-$env:OLLAMA_URL="http://127.0.0.1:11434"; npm run collect
-```
-
-After pushing, run **Collect Threat Intelligence** manually from the GitHub Actions tab once. Confirm that logs show `Step 3.5/4`, `LLM enrichment complete`, and normal database insertion. Do not print or inspect secret values in workflow logs.
-
-## Runtime behavior
-
-| Condition | Result |
-| --- | --- |
-| `GROQ_API_KEY` absent | LLM step is skipped; heuristic incidents continue unchanged |
-| Groq success with valid JSON | Validated fields and classifications are stored; `llm_model` records the response model |
-| Groq transient error | Up to three attempts use bounded exponential backoff; HTTP 429 honors `Retry-After` |
-| Groq invalid output | Output is rejected; configured Ollama is attempted |
-| Groq authentication failure | Groq is disabled for the rest of that run; configured Ollama can continue |
-| Ollama absent or also fails | The original heuristic incident is preserved with nullable LLM fields; the pipeline continues |
-| Low relevance confidence | The score is stored for downstream filtering; this integration does not silently delete the incident |
-
-Groq documents a 30 requests-per-minute limit and 14,400 requests per day for `llama-3.1-8b-instant`; it also documents HTTP 429 and the `retry-after` response header.[4] The client therefore starts Groq requests no less than two seconds apart, including retry attempts.
+The CI workflow runs `npm run llm:contract` and `npm run llm:quality` before the collector. The first is a provider protocol smoke test; the second runs two redacted deterministic fixtures plus one low-confidence downgrade case without contacting any external service. After pushing, run **Collect Threat Intelligence** manually once. Confirm that logs show the provider mode, preflight health result, configured confidence gate, `LLM enrichment complete`, aggregated token/latency counters, and normal database insertion. Never print secret values in workflow logs.
 
 ## References
 
-[1]: https://console.groq.com/docs/model/llama-3.1-8b-instant "GroqDocs — Llama 3.1 8B Instant"
-[2]: https://console.groq.com/docs/api-reference "GroqDocs — API Reference"
-[3]: https://console.groq.com/docs/structured-outputs "GroqDocs — Structured Outputs"
+[1]: https://console.groq.com/docs/deprecations "GroqDocs — Model Deprecation"
+[2]: https://console.groq.com/docs/models "GroqDocs — Supported Models and Pricing"
+[3]: https://docs.ollama.com/api/openai-compatibility "Ollama Documentation — OpenAI Compatibility"
 [4]: https://console.groq.com/docs/rate-limits "GroqDocs — Rate Limits"

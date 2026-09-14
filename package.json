@@ -9,7 +9,10 @@
     "dev": "tsx watch src/index.ts",
     "lint": "eslint src/**/*.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/**/*.test.ts"
+    "test": "tsx --test src/**/*.test.ts",
+    "llm:check": "tsx scripts/check-llm.ts",
+    "llm:contract": "tsx scripts/check-llm-contract.ts",
+    "llm:quality": "tsx scripts/check-llm-quality.ts"
   },
   "keywords": [
     "threat-intelligence",

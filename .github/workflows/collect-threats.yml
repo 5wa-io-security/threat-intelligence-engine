@@ -22,6 +22,9 @@ on:
 env:
   NODE_VERSION: '22'
 
+permissions:
+  contents: read
+
 jobs:
   collect:
     name: Run Threat Intelligence Collection
@@ -42,12 +45,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Validate LLM provider contracts
+        run: npm run llm:contract
+
+      - name: Validate LLM enrichment quality regression
+        run: npm run llm:quality
+
       - name: Run collector pipeline
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'auto' }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL || 'openai/gpt-oss-20b' }}
           OLLAMA_URL: ${{ secrets.OLLAMA_URL }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+          OLLAMA_MODEL: ${{ vars.OLLAMA_MODEL || 'llama3.1:8b' }}
+          LLM_MIN_CONFIDENCE: ${{ vars.LLM_MIN_CONFIDENCE || '0.65' }}
           LOG_LEVEL: ${{ inputs.log_level || 'info' }}
         run: npm run collect
 

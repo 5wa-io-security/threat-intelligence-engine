@@ -21,6 +21,11 @@ import { parseIncidents } from './parsers/incident-parser.js';
 import { testConnection } from './database/supabase-client.js';
 import { batchInsertIncidents, getIncidentCount } from './database/operations.js';
 import { enrichWithLLM } from './llm/classifier.js';
+import {
+  getLLMConfigWarnings,
+  isLLMConfigured,
+  loadLLMConfig,
+} from './llm/config.js';
 
 const logger = createLogger('main');
 
@@ -134,11 +139,24 @@ async function runPipeline(): Promise<CollectionStats> {
   }
 
   // ─── Step 3.5: Optional LLM Enrichment ──────────────────────────────────
-  if (process.env.GROQ_API_KEY?.trim()) {
-    logger.info('Step 3.5/4: Enriching incidents with LLM classification...');
+  const llmConfig = loadLLMConfig();
+  for (const warning of getLLMConfigWarnings(llmConfig)) {
+    logger.warn('LLM configuration warning', { warning });
+  }
+
+  if (isLLMConfigured(llmConfig)) {
+      logger.info('Step 3.5/4: Enriching incidents with LLM classification...', {
+        providerMode: llmConfig.providerMode,
+        groqModel: llmConfig.groqModel,
+        ollamaModel: llmConfig.ollamaModel,
+        ollamaConfigured: Boolean(llmConfig.ollamaUrl),
+        minConfidence: llmConfig.minConfidence,
+      });
 
     try {
-      incidents = await enrichWithLLM(incidents);
+      incidents = await enrichWithLLM(incidents, undefined, {
+        minConfidence: llmConfig.minConfidence,
+      });
     } catch (error) {
       // Per-incident failures are already handled inside enrichWithLLM. This
       // outer guard ensures an unexpected layer-level failure never stops the
@@ -148,7 +166,7 @@ async function runPipeline(): Promise<CollectionStats> {
       });
     }
   } else {
-    logger.info('Step 3.5/4: LLM enrichment skipped (GROQ_API_KEY not set)');
+    logger.info('Step 3.5/4: LLM enrichment skipped (no provider configured)');
   }
 
   // ─── Step 4: Deduplicate and Store in Database ───────────────────────────

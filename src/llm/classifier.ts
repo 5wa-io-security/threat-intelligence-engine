@@ -1,7 +1,12 @@
 import type { ThreatIncident } from '../database/operations.js';
 import type { AttackType, VictimType } from '../utils/constants.js';
 import { createLogger } from '../utils/logger.js';
-import { LLMClient, type LLMCompletion } from './llm-client.js';
+import { DEFAULT_LLM_MIN_CONFIDENCE, loadLLMConfig } from './config.js';
+import {
+  LLMClient,
+  type LLMCompletion,
+  type LLMProviderHealth,
+} from './llm-client.js';
 import {
   INCIDENT_ENRICHMENT_SYSTEM_PROMPT,
   buildIncidentEnrichmentPrompt,
@@ -36,12 +41,27 @@ export interface IncidentLLMEnrichment {
   confidence_score: number;
 }
 
+export interface EnrichmentCompletionMetadata {
+  provider: 'groq' | 'ollama';
+  model: string;
+  latencyMs?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+}
+
 export interface IncidentLLMClient {
   completeJson<T>(
     systemPrompt: string,
     userPrompt: string,
     parseResponse: (content: string) => T
   ): Promise<LLMCompletion<T>>;
+  checkHealth?: () => Promise<LLMProviderHealth[]>;
+}
+
+export interface EnrichmentOptions {
+  /** Minimum model confidence required before replacing heuristic fields. */
+  minConfidence?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -141,9 +161,20 @@ function syncClassificationTags(
   return [...new Set([attackType, victimType, ...preservedTags])];
 }
 
+function resolveMinConfidence(value: number | undefined): number {
+  const configured = value ?? loadLLMConfig().minConfidence ?? DEFAULT_LLM_MIN_CONFIDENCE;
+  if (!Number.isFinite(configured) || configured < 0 || configured > 1) {
+    throw new Error('LLM minimum confidence must be a number from 0 to 1');
+  }
+
+  return configured;
+}
+
 export async function enrichIncidentWithLLM(
   incident: ThreatIncident,
-  client: IncidentLLMClient
+  client: IncidentLLMClient,
+  onCompletion?: (metadata: EnrichmentCompletionMetadata) => void,
+  options: EnrichmentOptions = {}
 ): Promise<ThreatIncident> {
   const userPrompt = buildIncidentEnrichmentPrompt({
     title: incident.title,
@@ -159,6 +190,29 @@ export async function enrichIncidentWithLLM(
     parseIncidentLLMEnrichment
   );
   const enrichment = completion.content;
+  const minConfidence = resolveMinConfidence(options.minConfidence);
+
+  const promptTokens = completion.usage?.promptTokens ?? completion.usage?.promptEvalCount;
+  const completionTokens =
+    completion.usage?.completionTokens ?? completion.usage?.evalCount;
+  onCompletion?.({
+    provider: completion.provider,
+    model: completion.model,
+    latencyMs: completion.latencyMs,
+    promptTokens,
+    completionTokens,
+    totalTokens:
+      completion.usage?.totalTokens ??
+      (promptTokens !== undefined && completionTokens !== undefined
+        ? promptTokens + completionTokens
+        : undefined),
+  });
+
+  if (enrichment.confidence_score < minConfidence) {
+    throw new Error(
+      `LLM confidence ${enrichment.confidence_score.toFixed(2)} is below minimum ${minConfidence.toFixed(2)}`
+    );
+  }
 
   return {
     ...incident,
@@ -178,15 +232,65 @@ export async function enrichIncidentWithLLM(
 
 export async function enrichWithLLM(
   incidents: ThreatIncident[],
-  client: IncidentLLMClient = new LLMClient()
+  client: IncidentLLMClient = new LLMClient(),
+  options: EnrichmentOptions = {}
 ): Promise<ThreatIncident[]> {
   if (incidents.length === 0) return [];
 
-  logger.info('Starting sequential LLM enrichment', { count: incidents.length });
+  const minConfidence = resolveMinConfidence(options.minConfidence);
+
+  logger.info('Starting sequential LLM enrichment', {
+    count: incidents.length,
+    minConfidence,
+  });
+
+  if (client.checkHealth) {
+    try {
+      const health = await client.checkHealth();
+      logger.info('LLM provider health check complete', {
+        providers: health.map((item: LLMProviderHealth) => ({
+          provider: item.provider,
+          model: item.model,
+          reachable: item.reachable,
+          modelAvailable: item.modelAvailable,
+          latencyMs: item.latencyMs,
+          error: item.error,
+        })),
+      });
+    } catch (error) {
+      // Health checks are observability/preflight only. The normal completion
+      // path still owns fallback and graceful per-incident degradation.
+      logger.warn('LLM provider health check failed; continuing to completion path', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 
   const enrichedIncidents: ThreatIncident[] = [];
   let enriched = 0;
   let failed = 0;
+  const providerCounts: Record<string, number> = {};
+  const modelCounts: Record<string, number> = {};
+  let totalLatencyMs = 0;
+  let latencySamples = 0;
+  let totalPromptTokens = 0;
+  let totalCompletionTokens = 0;
+  let totalTokens = 0;
+
+  const recordCompletion = (metadata: EnrichmentCompletionMetadata): void => {
+    providerCounts[metadata.provider] = (providerCounts[metadata.provider] ?? 0) + 1;
+    modelCounts[metadata.model] = (modelCounts[metadata.model] ?? 0) + 1;
+
+    if (metadata.latencyMs !== undefined) {
+      totalLatencyMs += metadata.latencyMs;
+      latencySamples++;
+    }
+    if (metadata.promptTokens !== undefined) totalPromptTokens += metadata.promptTokens;
+    if (metadata.completionTokens !== undefined) {
+      totalCompletionTokens += metadata.completionTokens;
+    }
+    if (metadata.totalTokens !== undefined) totalTokens += metadata.totalTokens;
+  };
 
   // Sequential processing is intentional. LLMClient also enforces at least
   // two seconds between Groq request starts, including retry attempts.
@@ -194,14 +298,19 @@ export async function enrichWithLLM(
     const incident = incidents[index];
 
     try {
-      const enrichedIncident = await enrichIncidentWithLLM(incident, client);
+      const enrichedIncident = await enrichIncidentWithLLM(
+        incident,
+        client,
+        recordCompletion,
+        { minConfidence }
+      );
       enrichedIncidents.push(enrichedIncident);
       enriched++;
 
       logger.debug('Incident enriched with LLM', {
         position: index + 1,
         total: incidents.length,
-        title: incident.title.slice(0, 80),
+        source: incident.source_name,
         model: enrichedIncident.llm_model,
         severity: enrichedIncident.severity,
         confidenceScore: enrichedIncident.confidence_score,
@@ -214,7 +323,7 @@ export async function enrichWithLLM(
       logger.warn('LLM enrichment failed; preserving heuristic incident', {
         position: index + 1,
         total: incidents.length,
-        title: incident.title.slice(0, 80),
+        source: incident.source_name,
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -224,6 +333,12 @@ export async function enrichWithLLM(
     total: incidents.length,
     enriched,
     failed,
+    providerCounts,
+    modelCounts,
+    averageLatencyMs: latencySamples > 0 ? Math.round(totalLatencyMs / latencySamples) : null,
+    promptTokens: totalPromptTokens,
+    completionTokens: totalCompletionTokens,
+    totalTokens,
   });
 
   return enrichedIncidents;

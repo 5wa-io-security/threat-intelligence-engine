@@ -1,7 +1,7 @@
 # Commit Package Manifest
 
-**Package:** 5WA Threat Intelligence Engine — Groq LLM Integration  
-**Prepared:** 2026-08-15  
+**Package:** 5WA Threat Intelligence Engine — independent LLM/Ollama development stages
+**Prepared:** 2026-09-14
 **Author:** Manus AI
 
 | Path | Action | Size | SHA-256 |
@@ -20,5 +20,13 @@
 | `src/llm/prompts.ts` | Add | 3,419 bytes | `87db6e658a9088d08a069e50db23b571af04028bde43bbac79e9e702d1e6e113` |
 | `src/parsers/incident-parser.ts` | Replace | 9,255 bytes | `7a51edfa644666336322d82175b57b17a456cd682b94ea25e22bc0957f7d067d` |
 | `supabase/migrations/20260815000000_add_llm_enrichment_columns.sql` | Add | 428 bytes | `8a645bdda0ad445ece59fff75d755d944b6bd3ff80c668dadd91815182ab103a` |
+| `src/llm/config.ts` | Add | 4,863 bytes; `bea1e40963de34e3192d04a0864bcb67c8e77b9449fba229b49e576c3a06f962` |
+| `src/llm/config.test.ts` | Add | 3,000 bytes; `2db476d6203b727a730020a532da7c5b51ea961575582290e4a3379eb6d8731b` |
+| `src/llm/quality-fixtures.ts` | Add | 2,062 bytes; `9e556a4becb38d9ba65c47ca042eb989fb97b7ed1b7f2b700995ff8d6dd5aae4` |
+| `scripts/check-llm-contract.ts` | Add | 8,789 bytes; `a5567bac897cc8a308f0fefce5edc588c6bd44a79744c6cd396158bd4e62b730` |
+| `scripts/check-llm-quality.ts` | Add | 3,352 bytes; `b4e0503d2c299723fad212405d0f7a7c3fe441b701a96ae7bd6d773dad0bff17` |
+| `scripts/check-llm.ts` | Add | 1,154 bytes; `35e528780e700082bb67955220fbae471e32bdb8835ddfa80079667685bc2c83` |
+| `INDEPENDENT_DEVELOPMENT_AUDIT.md` | Add | 5,218 bytes; `fa18de5c1311bb6d6acd2b667264bb6b289c706eb865023feee271c66cc5dc59` |
+| `JETSON_ONBOARDING_CHECKLIST.md` | Add | 3,240 bytes; `b43edf689bb5e3a5daf260e09642460c439aa461177c9c141fdad616732759f8` |
 
 `FILE_MANIFEST.md` is intentionally excluded from its own checksum table.

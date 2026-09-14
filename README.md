@@ -24,14 +24,15 @@ This data powers the 5WA platform's threat map, risk assessments, and security a
 ### Pipeline Flow
 
 ```
-Sources → Collectors → Keyword Filter → Parsers → Deduplication → Supabase
+Sources → Collectors → Keyword Filter → Parsers → LLM Enrichment → Deduplication → Supabase
 ```
 
 1. **Collect** — Fetch raw data from RSS feeds, Reddit search, and GitHub
 2. **Filter** — Only retain articles matching physical attack keywords
 3. **Parse** — Extract structured fields (geo, amount, attack type, victim type)
-4. **Deduplicate** — Check source_url against existing records
-5. **Store** — Insert new incidents into the `threat_incidents` table
+4. **Enrich** — Optionally validate and improve classification, severity, summary, and confidence with Groq or Ollama
+5. **Deduplicate** — Check source_url and recent event similarity against existing records
+6. **Store** — Insert new incidents into the `threat_incidents` table
 
 ---
 
@@ -83,6 +84,18 @@ npm run collect
 ```
 
 This executes the full pipeline once and outputs structured JSON logs.
+
+For provider-independent validation, run the deterministic checks before enabling live enrichment:
+
+```bash
+npm test
+npm run llm:contract
+npm run llm:quality
+npm run typecheck
+npm run build
+```
+
+`LLM_MIN_CONFIDENCE` defaults to `0.65`. A schema-valid model response below that confidence threshold is rejected as an enrichment result, so the original heuristic incident remains unchanged.
 
 ### Development Mode
 
@@ -265,12 +278,12 @@ Before inserting, the pipeline queries existing `source_url` values. Only new UR
 
 ## Future Roadmap
 
-- [ ] **LLM-Powered Classification** — Use GPT/Claude for more accurate attack type and severity classification
+- [x] **LLM-Powered Classification** — Provider-aware Groq/Ollama enrichment with runtime validation and fallback
 - [ ] **Telegram Bot Integration** — Real-time alerts when new high-severity incidents are detected
 - [ ] **Threat Map API** — RESTful API endpoint for the 5WA platform dashboard
 - [ ] **Historical Backfill** — One-time import of all historical Lopp list entries
 - [ ] **Additional Sources** — The Block, Decrypt, local news RSS feeds
-- [ ] **Severity Scoring** — Automated risk scoring based on amount, weapon use, and outcome
+- [x] **Severity Scoring** — Validated 1–10 LLM severity with a configurable confidence gate
 - [ ] **Victim Notification** — Anonymous tip system for unreported incidents
 - [ ] **Geospatial Analysis** — Heatmap generation and regional trend detection
 - [ ] **Multi-language Support** — Parse non-English sources (Spanish, Portuguese, Russian)
