@@ -57,6 +57,7 @@ export interface IncidentLLMClient {
     parseResponse: (content: string) => T
   ): Promise<LLMCompletion<T>>;
   checkHealth?: () => Promise<LLMProviderHealth[]>;
+  hasAvailableProvider?: () => boolean;
 }
 
 export interface EnrichmentOptions {
@@ -296,6 +297,16 @@ export async function enrichWithLLM(
   // two seconds between Groq request starts, including retry attempts.
   for (let index = 0; index < incidents.length; index++) {
     const incident = incidents[index];
+
+    if (client.hasAvailableProvider && !client.hasAvailableProvider()) {
+      const remaining = incidents.slice(index);
+      failed += remaining.length;
+      enrichedIncidents.push(...remaining);
+      logger.warn('No LLM providers remain available; preserving remaining heuristic incidents', {
+        remaining: remaining.length,
+      });
+      break;
+    }
 
     try {
       const enrichedIncident = await enrichIncidentWithLLM(

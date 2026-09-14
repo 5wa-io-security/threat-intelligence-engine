@@ -55,9 +55,11 @@ Groq’s API supports the OpenAI-compatible chat-completions endpoint and JSON o
 
 Before processing incidents, the default client performs one `GET /v1/models` preflight request for each configured provider. It checks endpoint reachability and, when the endpoint returns model IDs, verifies the configured model. An unavailable provider is disabled for the remainder of that run, preventing a stopped Jetson from causing a timeout for every incident.
 
-The health check is observability only. The normal completion path still performs provider fallback and runtime JSON validation. If every provider fails, the original heuristic incident is preserved and the pipeline continues. No prompt, raw article content, API key, or full model response is written to logs.
+The health check is observability only. The normal completion path still performs provider fallback and runtime JSON validation. If Groq returns a daily token-quota response such as `tokens per day (TPD)`, the client treats it as non-retryable, disables Groq for the rest of the run, and immediately tries Ollama when configured. If every provider fails, the original heuristic incident is preserved and the remaining incidents are not sent through an already-exhausted provider. No prompt, raw article content, API key, or full model response is written to logs.
 
 The confidence gate provides a second, provider-independent safety boundary. A valid JSON response whose `confidence_score` is below `LLM_MIN_CONFIDENCE` is treated as a failed enrichment: the original heuristic incident is returned unchanged, including its nullable LLM fields. The default is `0.65`; raise it for conservative production operation or set it to `0` when intentionally accepting every schema-valid model result.
+
+If a run reports that Groq was disabled because its daily quota was exhausted, this is an expected provider-capacity condition rather than a collector failure. Configure `LLM_PROVIDER=ollama` for a Jetson-only run, add a reachable `OLLAMA_URL` while keeping `LLM_PROVIDER=auto`, or wait for the provider quota window to reset. Do not increase retry counts for this error; retries cannot restore a daily quota during the same run.
 
 Do not expose an unauthenticated Ollama port directly to the public Internet. Keep plain HTTP on localhost or a private VPN, or place the endpoint behind HTTPS and authentication. The configuration layer emits a warning whenever `OLLAMA_URL` uses plain HTTP.
 

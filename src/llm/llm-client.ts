@@ -151,6 +151,17 @@ function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
+function isDailyQuotaError(status: number, message: string): boolean {
+  if (status !== 429) return false;
+
+  // Groq uses HTTP 429 for both short-lived RPM throttling and quotas that
+  // cannot recover during this collection run. Do not retry the latter once
+  // per incident because it only burns time and sends doomed requests.
+  return /tokens\s+per\s+day|\btpd\b|daily\s+(?:token|request|quota|limit)|quota\s+(?:exceeded|reached)/i.test(
+    message
+  );
+}
+
 function getErrorMessage(payload: unknown, fallback: string): string {
   if (!isRecord(payload)) return fallback;
 
@@ -258,6 +269,12 @@ export class LLMClient {
     }
 
     return healthResults;
+  }
+
+  hasAvailableProvider(): boolean {
+    return getConfiguredProviders(this.config).some(
+      (provider) => !this.disabledProviders.has(provider)
+    );
   }
 
   private async checkProviderHealth(
@@ -386,12 +403,17 @@ export class LLMClient {
         errors.push(`${provider}: ${message}`);
 
         if (
-          provider === 'groq' &&
           error instanceof ProviderRequestError &&
-          (error.status === 401 || error.status === 403)
+          (error.status === 401 ||
+            error.status === 403 ||
+            (error.status === 429 && !error.retryable))
         ) {
-          this.disabledProviders.add('groq');
-          logger.warn('Groq authentication failed; disabling Groq for the rest of this run');
+          this.disabledProviders.add(provider);
+          logger.warn('LLM provider is unavailable for the rest of this run; disabling it', {
+            provider,
+            status: error.status,
+            reason: error.message,
+          });
         } else {
           logger.warn('LLM provider failed; checking the next configured provider', {
             provider,
@@ -543,8 +565,9 @@ export class LLMClient {
 
       if (!response.ok) {
         const fallback = `${provider} request failed with HTTP ${response.status}`;
+        const errorMessage = getErrorMessage(payload, fallback);
         throw new ProviderRequestError(
-          getErrorMessage(payload, fallback),
+          errorMessage,
           provider,
           response.status,
           parseRetryAfter(
@@ -552,7 +575,7 @@ export class LLMClient {
             this.now,
             this.config.maxRetryDelayMs
           ),
-          isRetryableStatus(response.status)
+          isRetryableStatus(response.status) && !isDailyQuotaError(response.status, errorMessage)
         );
       }
 

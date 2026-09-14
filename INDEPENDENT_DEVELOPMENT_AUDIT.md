@@ -37,7 +37,7 @@ Ollama 官方定價頁將本機執行列為無服務費；本案的本地成本�
 
 ## 本階段已完成的獨立開發
 
-已完成現行 Groq model 更新、typed provider configuration、`auto/groq/ollama` mode、Ollama `/v1/models` health check、可選 API key、URL 安全驗證、usage/latency metadata、aggregate logging、`npm run llm:check` 與 Jetson 接入清單。測試套件目前通過 18/18。
+已完成現行 Groq model 更新、typed provider configuration、`auto/groq/ollama` mode、Ollama `/v1/models` health check、可選 API key、URL 安全驗證、usage/latency metadata、aggregate logging、`npm run llm:check` 與 Jetson 接入清單。後續又加入 daily-token-quota-aware circuit breaker：Groq 回傳 TPD 額度耗盡時不再重試，會立即 fallback 或保留 heuristic 結果；目前隔離 LLM 測試套件通過 22/22。
 
 ## 暫不在本階段執行的項目
 

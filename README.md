@@ -97,6 +97,8 @@ npm run build
 
 `LLM_MIN_CONFIDENCE` defaults to `0.65`. A schema-valid model response below that confidence threshold is rejected as an enrichment result, so the original heuristic incident remains unchanged.
 
+When Groq reports daily token exhaustion (`tokens per day` / `TPD`), the collector disables Groq for the remainder of that run instead of retrying every incident. In `auto` mode it immediately falls back to a configured Ollama endpoint; with no fallback, all remaining incidents retain their heuristic classifications and continue to storage.
+
 ### Development Mode
 
 ```bash

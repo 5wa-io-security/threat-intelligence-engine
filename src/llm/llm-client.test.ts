@@ -97,6 +97,50 @@ test('LLMClient honors Retry-After on a transient Groq failure', async () => {
   assert.deepEqual(delays, [3_000]);
 });
 
+test('LLMClient disables Groq on daily token quota exhaustion and falls back immediately', async () => {
+  let groqCalls = 0;
+  const urls: string[] = [];
+  const fetchImpl: typeof fetch = async (input) => {
+    const url = String(input);
+    urls.push(url);
+
+    if (url.startsWith('https://api.groq.com/')) {
+      groqCalls++;
+      return new Response(
+        JSON.stringify({
+          error: {
+            message:
+              'Rate limit reached for model openai/gpt-oss-20b: tokens per day (TPD): Limit 200000, Used 199999, Requested 900',
+          },
+        }),
+        { status: 429, headers: { 'Content-Type': 'application/json', 'Retry-After': '20' } }
+      );
+    }
+
+    return completionResponse('{"ok":true}', 'llama3.1:8b');
+  };
+
+  const client = new LLMClient({
+    groqApiKey: 'test-key',
+    ollamaUrl: 'http://localhost:11434',
+    fetchImpl,
+    sleep: async () => {
+      throw new Error('daily quota failure must not sleep before fallback');
+    },
+    now: () => 0,
+  });
+
+  const completion = await client.completeJson('system', 'user', JSON.parse);
+
+  assert.equal(completion.provider, 'ollama');
+  assert.equal(groqCalls, 1);
+  assert.deepEqual(urls, [
+    'https://api.groq.com/openai/v1/chat/completions',
+    'http://localhost:11434/v1/chat/completions',
+  ]);
+  assert.equal(client.hasAvailableProvider(), true);
+});
+
 test('LLMClient uses Ollama when Groq output fails classifier validation', async () => {
   const urls: string[] = [];
   const fetchImpl: typeof fetch = async (input) => {

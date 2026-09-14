@@ -8,7 +8,7 @@ The integration was validated without calling Groq, without using the exposed ke
 
 | Check | Result | Scope |
 | --- | --- | --- |
-| Unit tests | **Passed: 20/20** | Configuration, current model default, provider mode, URL validation, JSON validation, classification override, confidence gate, graceful failure, request shape, throttle, retry, health checks, Ollama-only mode, fallback, and usage metadata |
+| Unit tests | **Passed: 22/22** | Configuration, current model default, provider mode, URL validation, JSON validation, classification override, confidence gate, graceful failure, provider exhaustion short-circuit, request shape, throttle, transient retry, daily quota circuit breaker, health checks, Ollama-only mode, fallback, and usage metadata |
 | Provider contract smoke | **Passed** | Disposable local HTTP servers for `/v1/models`, JSON-mode completion, usage, fallback, retry, and timeout; no external provider contacted |
 | LLM quality regression | **Passed** | Two redacted deterministic fixtures plus one low-confidence downgrade case; no external provider contacted |
 | Strict TypeScript check | **Passed** | Complete repository after provider contract and confidence-gate integration |
@@ -21,6 +21,8 @@ The integration was validated without calling Groq, without using the exposed ke
 ## Independent changes now validated
 
 The default Groq model is now `openai/gpt-oss-20b`, replacing the retired `llama-3.1-8b-instant`. The provider mode can be `auto`, `groq`, or `ollama`. The client performs one `/v1/models` preflight per configured provider, supports optional `OLLAMA_API_KEY`, normalizes Groq/Ollama usage metadata, and records aggregate provider/model/latency/token counters without logging article content or secrets.
+
+The quota-safety gate now distinguishes a daily token quota 429 from a transient rate-limit 429. A daily quota error is not retried, disables Groq for the current run, falls back to Ollama when available, and prevents the classifier from repeatedly attempting an exhausted provider for the remaining incidents. A transient 429 still honors `Retry-After` and exponential backoff.
 
 The Jetson connection can be tested later with:
 
@@ -60,3 +62,5 @@ npm run llm:check
 ```
 
 The final `npm run llm:check` command is expected to exit with code `1` in an environment with no `GROQ_API_KEY` and no `OLLAMA_URL`; it is a configuration smoke check, not a no-provider success case. On Jetson or a configured provider host, it should instead report reachable health and model availability.
+
+The attached stage package is intentionally a merge package rather than a standalone repository: the complete application must provide the existing collectors, logger, constants, Supabase client, and TypeScript configuration referenced by the staged files.

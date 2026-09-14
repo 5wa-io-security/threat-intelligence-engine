@@ -144,3 +144,21 @@ test('enrichWithLLM preserves the original incident when a call fails', async ()
   assert.equal(result.confidence_score, null);
   assert.equal(result.llm_model, null);
 });
+
+test('enrichWithLLM preserves the remaining incidents after providers are exhausted', async () => {
+  const incidents = [makeIncident(), makeIncident({ title: 'Second incident' })];
+  let calls = 0;
+  const exhaustedClient: IncidentLLMClient = {
+    hasAvailableProvider: () => calls === 0,
+    async completeJson<_T>(): Promise<never> {
+      calls++;
+      throw new Error('daily quota exhausted');
+    },
+  };
+
+  const result = await enrichWithLLM(incidents, exhaustedClient);
+
+  assert.equal(calls, 1);
+  assert.strictEqual(result[0], incidents[0]);
+  assert.strictEqual(result[1], incidents[1]);
+});
